@@ -11,7 +11,6 @@ const gitUrlParse = require('git-url-parse');
 const { Storage } = require('@google-cloud/storage');
 
 exports.handler = async (event, context) => {
-// const run = async () => {
   console.log('Lambda function invoked');
   const bucket = process.env.BUCKET_NAME;
   const dynamoDB = process.env.DYNAMODB_TABLE;
@@ -34,28 +33,44 @@ exports.handler = async (event, context) => {
     const snsMessage = JSON.parse(event.Records[0].Sns.Message);
     const email = snsMessage.email;
     const githubRepoUrl = snsMessage.url;
+    const emailDetails = {
+      email: email,
+      submissionURL: githubRepoUrl,
+      gcsURL: '',
+      emailSentTime: '',
+      assignmentId: snsMessage.assignmentId,
+      accountId: snsMessage.accountId,
+      status: ''
+    };
 
     // Download GitHub repo as a zip file
     const zipFile = await downloadGitHubRepo(email, githubRepoUrl);
 
     // Upload zip file to Google Cloud Storage
-    const googleStorageUrl = await uploadToGoogleStorage(bucket, storage, zipFile, email);
+    let googleStorageUrl;
+    let emailSent;
 
-    // Send email through SES
-    const emailSent = await sendEmail(email, sourceEmail, 'Submission Successful', 'Your submission was successful.');
-    
-    const saveToDyanmo = await saveToDynamoDB(dynamoDB, email, googleStorageUrl, emailSent);
+    try {
+      googleStorageUrl = await uploadToGoogleStorage(bucket, storage, zipFile, email);
+      // If successfully uploaded, send success email
+      emailDetails.status = 'success';
+      emailDetails.gcsURL = googleStorageUrl;
+      emailSent = await sendEmail(email, sourceEmail, 'Submission Successful', 'Your submission was successful.');
+    } catch (uploadError) {
+      // If upload fails, send error email
+      emailDetails.status = 'falied';
+      emailSent = await sendEmail(email, sourceEmail, 'Error Uploading to Google Cloud Storage', `Error: ${uploadError}`);
+      throw uploadError; // Re-throw the error to propagate it further
+    }
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify('Success'),
-    };
+    // Save data to DynamoDB only if the email was sent successfully
+    if (emailSent) {
+      const saveToDyanmo = await saveToDynamoDB(dynamoDB, emailDetails);
+    }
+    return `Successfully processed ${githubRepoUrl} for ${email}`;
   } catch (error) {
     console.error('Error:', error);
-    return {
-      statusCode: 500,
-      body: JSON.stringify('Error'),
-    };
+    throw error; // Re-throw the error to propagate it further
   }
 };
 
@@ -135,22 +150,19 @@ const sendEmail = async(toEmail, sourceEmail, subject, message) => {
   });
 }
 
-const saveToDynamoDB = async(dynamoDB, email, githubRepoUrl, emailSent) => {
+const saveToDynamoDB = async(dynamoDB, emailDetails) => {
   return new Promise(async (resolve, reject) => {
     try {
       let date = new Date().toISOString();
-      console.log('emailSent: ', emailSent);
+      console.log('Saving in dynamo db', emailDetails);
+      emailDetails.emailSent = date;
       const params = {
         TableName: dynamoDB,
-        Item: {
-          Email: email,
-          URL: githubRepoUrl,
-          EmailSentTime: date,
-        },
+        Item: emailDetails,
       };
       
       const data = await dynamodb.put(params).promise();
-      console.log('saved data to dynamo db');
+      console.log('Saved to dynamo db', params);
       resolve(data);
     } catch (error) {
       console.error('Error saving data to DynamoDB:', error);
