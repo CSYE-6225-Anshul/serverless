@@ -9,6 +9,7 @@ const download = require('download');
 const path = require('path');
 const gitUrlParse = require('git-url-parse');
 const { Storage } = require('@google-cloud/storage');
+const uuid = require('uuid');
 
 exports.handler = async (event, context) => {
   console.log('Lambda function invoked');
@@ -154,8 +155,12 @@ const saveToDynamoDB = async(dynamoDB, emailDetails) => {
   return new Promise(async (resolve, reject) => {
     try {
       let date = new Date().toISOString();
-      console.log('Saving in dynamo db', emailDetails);
+      // Generate a random UUID
+      const randomUUID = uuid.v4();
+      // Add the random UUID to the emailDetails
+      emailDetails.id = randomUUID;
       emailDetails.emailSent = date;
+      console.log('Saving in dynamo db', emailDetails);
       const params = {
         TableName: dynamoDB,
         Item: emailDetails,
