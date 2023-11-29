@@ -4,10 +4,9 @@ AWS.config.update({ region: process.env.REGION });
 const sns = new AWS.SNS();
 const dynamodb = new AWS.DynamoDB.DocumentClient();
 const ses = new AWS.SES();
-const fs = require('fs');
+const fs = require('fs').promises;
 const download = require('download');
 const path = require('path');
-const gitUrlParse = require('git-url-parse');
 const { Storage } = require('@google-cloud/storage');
 const uuid = require('uuid');
 
@@ -45,33 +44,39 @@ exports.handler = async (event, context) => {
     };
 
     // Download GitHub repo as a zip file
-    const zipFile = await downloadGitHubRepo(email, githubRepoUrl);
-
+    let zipFile;
     // Upload zip file to Google Cloud Storage
     let googleStorageUrl;
     let emailSent;
-
-    try {
+    
+    zipFile = await downloadGitHubRepo(email, githubRepoUrl);
+    if(zipFile.error) {
+      console.log('zipfile not found: ', zipFile);
+      emailDetails.status = 'failed';
+      emailDetails.gcsURL = 'null';
+      emailSent = await sendEmail(email, sourceEmail, 'Submission Unsuccessful', `Error: ${zipFile.error}`, dynamoDB, emailDetails);
+      return zipFile.error;
+    } else {
+      console.log('zipfile found', zipFile);
+      // If successfully downloaded, upload to Google Cloud Storage
       googleStorageUrl = await uploadToGoogleStorage(bucket, storage, zipFile, email);
+      if(googleStorageUrl.error) {
+        emailDetails.status = 'failed';
+        emailDetails.gcsURL = 'null';
+        emailSent = await sendEmail(email, sourceEmail, 'Submission Unsuccessful', 'Error: Could not upload zip file. Try again!', dynamoDB, emailDetails);
+        return googleStorageUrl.error;
+      }
+
       // If successfully uploaded, send success email
       emailDetails.status = 'success';
-      emailDetails.gcsURL = googleStorageUrl;
-      emailSent = await sendEmail(email, sourceEmail, 'Submission Successful', 'Your submission was successful.');
-    } catch (uploadError) {
-      // If upload fails, send error email
-      emailDetails.status = 'falied';
-      emailSent = await sendEmail(email, sourceEmail, 'Error Uploading to Google Cloud Storage', `Error: ${uploadError}`);
-      throw uploadError; // Re-throw the error to propagate it further
+      emailDetails.gcsURL = googleStorageUrl.utilURL;
+      emailDetails.authenticatedURL = googleStorageUrl.authenticatedURL;
+      emailSent = await sendEmail(email, sourceEmail, 'Submission Successful', 'Your submission was successful.', dynamoDB, emailDetails);
+      return `Successfully processed ${githubRepoUrl} for ${email}`;
     }
-
-    // Save data to DynamoDB only if the email was sent successfully
-    if (emailSent) {
-      const saveToDyanmo = await saveToDynamoDB(dynamoDB, emailDetails);
-    }
-    return `Successfully processed ${githubRepoUrl} for ${email}`;
   } catch (error) {
     console.error('Error:', error);
-    throw error; // Re-throw the error to propagate it further
+    return error; // Re-throw the error to propagate it further
   }
 };
 
@@ -79,25 +84,44 @@ const downloadGitHubRepo = async(email, githubRepoUrl) => {
   try {
     const tempDir = '/tmp';
     const url = githubRepoUrl;
-    const zipURL = url + '/archive/main.zip';
-    const parsedUrl = gitUrlParse(url);
 
-    // Extract repository name
-    const repositoryName = parsedUrl.name;
-    await download(zipURL, tempDir);
+    // Check if the URL ends with '.zip'
+    if (!url.toLowerCase().endsWith('.zip')) {
+      return {
+        error: 'Invalid GitHub repository URL. It must be a link to a zip file.'
+      }
+    }
 
-    const zipFileName = repositoryName + '-main.zip';
-    const zipFilePath = path.join(tempDir, zipFileName);  
-    console.log('Downloaded GitHub repo:', zipFilePath);
-    return zipFilePath;
+    // Download the buffer
+    let buffer = await download(url);
+
+   // Generate a unique file name
+   const fileName = `${email}_${Date.now()}.zip`;
+   const zipFilePath = `${tempDir}/${fileName}`;
+
+   // Save the buffer to a file
+   await fs.writeFile(zipFilePath, buffer, 'binary');
+   console.log('Downloaded GitHub repo:', zipFilePath);
+
+   // Check if the '.zip' did not download
+   if (!zipFilePath) {
+    return {
+      error: 'Invalid URL or Zip file.'
+    }
+  }
+   // Return the path of the saved file
+   return zipFilePath;
   } catch (error) {
     console.error('Error downloading GitHub repo:', error);
-    throw error; // Re-throw the error to propagate it further
+    return {
+      error: 'Invalid URL or Zip file.'
+    }; 
   }
 }
 
 const uploadToGoogleStorage = async(bucketName, storage, filePath, email) => {
   try {
+    console.log('Uploading to Google Cloud Storage');
     const bucket = storage.bucket(bucketName);
     const currentDateTime = new Date().toISOString().replace(/:/g, '-');
     const destinationFileName = `${email}_${currentDateTime}.zip`;
@@ -111,18 +135,24 @@ const uploadToGoogleStorage = async(bucketName, storage, filePath, email) => {
     });
 
     console.log('Upload to Google Cloud Storage finished');
-    return `gs://${bucketName}/${destinationFileName}`;
+    return {
+      authenticatedURL: `storage.cloud.google.com/${bucketName}/${destinationFileName}`.replace(/@/g, '%40'),
+      utilURL: `gs://${bucketName}/${destinationFileName}`,
+    };
   } catch (error) {
     console.error('Error uploading to Google Cloud Storage:', error);
-    return error;
+    return {
+      error: error
+    };
   }
 }
 
-const sendEmail = async(toEmail, sourceEmail, subject, message) => {
-  return new Promise(async (resolve, reject) => {
+const sendEmail = async(toEmail, sourceEmail, subject, message, dynamoDB, emailDetails) => {
+  // return new Promise(async (resolve, reject) => {
     try {
       console.log('Sending email', toEmail, sourceEmail, subject, message);
-      const params = {
+      if(emailDetails.status == 'success') message += ` \n\nGCS UTIL URL: ${emailDetails.gcsURL} \n\nGCS URL: ${emailDetails.authenticatedURL}`;
+      const emailParams = {
         Destination: {
           ToAddresses: [toEmail],
         },
@@ -141,37 +171,27 @@ const sendEmail = async(toEmail, sourceEmail, subject, message) => {
         Source: sourceEmail,
       };
       
-      const result = await ses.sendEmail(params).promise();
+      const result = await ses.sendEmail(emailParams).promise();
       console.log('Email sent successfully:', result);
-      resolve(result);
-    } catch (error) {
-      console.error('Error sending email:', error);
-      reject(error);
-    }
-  });
-}
 
-const saveToDynamoDB = async(dynamoDB, emailDetails) => {
-  return new Promise(async (resolve, reject) => {
-    try {
-      let date = new Date().toISOString();
+      // Saving EMAIL DETAILS to DB
       // Generate a random UUID
       const randomUUID = uuid.v4();
-      // Add the random UUID to the emailDetails
       emailDetails.id = randomUUID;
-      emailDetails.emailSent = date;
+      let date = new Date().toISOString();
+      emailDetails.emailSentTime = date;
       console.log('Saving in dynamo db', emailDetails);
-      const params = {
+      const dbParams = {
         TableName: dynamoDB,
         Item: emailDetails,
       };
       
-      const data = await dynamodb.put(params).promise();
-      console.log('Saved to dynamo db', params);
-      resolve(data);
+      const data = await dynamodb.put(dbParams).promise();
+      console.log('Saved to dynamo db', dbParams);
+      return result;
     } catch (error) {
-      console.error('Error saving data to DynamoDB:', error);
-      reject(error);
+      console.error('Error sending email:', error);
+      return error;
     }
-  });
+  // });
 }
