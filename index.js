@@ -123,7 +123,7 @@ const sendEmail = async(toEmail, sourceEmail, subject, message) => {
       console.log('Sending email', toEmail, sourceEmail, subject, message);
       const params = {
         Destination: {
-          ToAddresses: ['anshuls1610@gmail.com'],
+          ToAddresses: [toEmail],
         },
         Message: {
           Body: {
